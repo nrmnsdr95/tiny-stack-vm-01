@@ -1,8 +1,8 @@
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join as pathJoin } from 'node:path';
 
-// Opcode table: [opcode, immediate_bytes, pops, pushes]
-const OPS: [number, number, number, number][] = [
+// Opcode table: [code, immSize, pops, pushes]
+const INSTRUCTION_TABLE: [number, number, number, number][] = [
   [0x00, 0, 0, 0], [0x01, 1, 0, 1], [0x02, 4, 0, 1], [0x03, 0, 1, 0],
   [0x04, 0, 1, 2], [0x05, 0, 2, 2], [0x06, 0, 2, 3], [0x07, 0, 3, 3],
   [0x10, 0, 2, 1], [0x11, 0, 2, 1], [0x12, 0, 2, 1], [0x13, 0, 2, 1],
@@ -15,129 +15,139 @@ const OPS: [number, number, number, number][] = [
   [0x53, 0, 1, 0],
 ];
 
-const OP_IMM = new Int8Array(256).fill(-1);
-const OP_POPS = new Uint8Array(256);
-const OP_PUSHES = new Uint8Array(256);
-for (const [code, imm, pops, pushes] of OPS) {
-  OP_IMM[code] = imm;
-  OP_POPS[code] = pops;
-  OP_PUSHES[code] = pushes;
+const IMM_SIZES = new Int8Array(256).fill(-1);
+const POP_COUNTS = new Uint8Array(256);
+const PUSH_COUNTS = new Uint8Array(256);
+for (const [code, imm, pops, pushes] of INSTRUCTION_TABLE) {
+  IMM_SIZES[code] = imm;
+  POP_COUNTS[code] = pops;
+  PUSH_COUNTS[code] = pushes;
 }
 
-const enc = new TextEncoder();
+const textEncoder = new TextEncoder();
 
-export function runVM(p: Uint8Array, inp: Uint8Array) {
-  const n = p.length;
-  const D = new Int32Array(256);
-  const C = new Int32Array(64);
-  const M = new Int32Array(256);
-  const out = new Uint8Array(65536);
-  let sp = 0, csp = 0, olen = 0, inPos = 0, pc = 0, steps = 0;
-  const done = (code: number) => ({ stdout: out.subarray(0, olen), exit: code });
+export function executeVM(program: Uint8Array, input: Uint8Array) {
+  const codeLen = program.length;
+  const dataStack = new Int32Array(256);
+  const callStack = new Int32Array(64);
+  const memory = new Int32Array(256);
+  const outBuf = new Uint8Array(65536);
 
-  for (;;) {
-    if (steps === 1000000) return done(10);
-    if (pc < 0 || pc >= n) return done(9);
-    const op = p[pc];
-    const imm = OP_IMM[op];
-    if (imm === -1) return done(5);
-    if (pc + imm >= n) return done(9);
+  let stackDepth = 0, callDepth = 0, outPtr = 0, inPtr = 0, pcReg = 0, steps = 0;
+  const terminate = (exitCode: number) => ({ stdout: outBuf.subarray(0, outPtr), exit: exitCode });
+
+  while (true) {
+    if (steps === 1000000) return terminate(10);
+    if (pcReg < 0 || pcReg >= codeLen) return terminate(9);
+
+    const opcode = program[pcReg];
+    const immLen = IMM_SIZES[opcode];
+    if (immLen === -1) return terminate(5);
+    if (pcReg + immLen >= codeLen) return terminate(9);
+
     steps++;
-    const next = pc + 1 + imm;
-    if (sp < OP_POPS[op]) return done(2);
-    if (sp - OP_POPS[op] + OP_PUSHES[op] > 256) return done(3);
-    pc = next;
+    const nextPc = pcReg + 1 + immLen;
+    if (stackDepth < POP_COUNTS[opcode]) return terminate(2);
+    if (stackDepth - POP_COUNTS[opcode] + PUSH_COUNTS[opcode] > 256) return terminate(3);
+    pcReg = nextPc;
 
-    if (op >= 0x10 && op <= 0x22 && op !== 0x17 && op !== 0x1b) {
-      const b = D[sp - 1], a = D[sp - 2];
-      let r = 0;
-      switch (op) {
-        case 0x10: r = (a + b) | 0; break;
-        case 0x11: r = (a - b) | 0; break;
-        case 0x12: r = Math.imul(a, b); break;
-        case 0x13: if (b === 0) return done(4); r = a === -2147483648 && b === -1 ? a : (a / b) | 0; break;
-        case 0x14: if (b === 0) return done(4); r = b === -1 ? 0 : (a % b) | 0; break;
-        case 0x15: if (b === 0) return done(4); r = Math.floor((a >>> 0) / (b >>> 0)) | 0; break;
-        case 0x16: if (b === 0) return done(4); r = ((a >>> 0) % (b >>> 0)) | 0; break;
-        case 0x18: r = a & b; break;
-        case 0x19: r = a | b; break;
-        case 0x1a: r = a ^ b; break;
-        case 0x1c: r = a << (b & 31); break;
-        case 0x1d: r = a >> (b & 31); break;
-        case 0x1e: r = (a >>> (b & 31)) | 0; break;
-        case 0x20: r = a === b ? 1 : 0; break;
-        case 0x21: r = a < b ? 1 : 0; break;
-        case 0x22: r = (a >>> 0) < (b >>> 0) ? 1 : 0; break;
+    // Fast path: binary arithmetic and bitwise / comparison operations
+    if (opcode >= 0x10 && opcode <= 0x22 && opcode !== 0x17 && opcode !== 0x1b) {
+      const right = dataStack[stackDepth - 1];
+      const left = dataStack[stackDepth - 2];
+      let res = 0;
+      switch (opcode) {
+        case 0x10: res = (left + right) | 0; break;
+        case 0x11: res = (left - right) | 0; break;
+        case 0x12: res = Math.imul(left, right); break;
+        case 0x13: if (right === 0) return terminate(4); res = left === -2147483648 && right === -1 ? left : (left / right) | 0; break;
+        case 0x14: if (right === 0) return terminate(4); res = right === -1 ? 0 : (left % right) | 0; break;
+        case 0x15: if (right === 0) return terminate(4); res = Math.floor((left >>> 0) / (right >>> 0)) | 0; break;
+        case 0x16: if (right === 0) return terminate(4); res = ((left >>> 0) % (right >>> 0)) | 0; break;
+        case 0x18: res = left & right; break;
+        case 0x19: res = left | right; break;
+        case 0x1a: res = left ^ right; break;
+        case 0x1c: res = left << (right & 31); break;
+        case 0x1d: res = left >> (right & 31); break;
+        case 0x1e: res = (left >>> (right & 31)) | 0; break;
+        case 0x20: res = left === right ? 1 : 0; break;
+        case 0x21: res = left < right ? 1 : 0; break;
+        case 0x22: res = (left >>> 0) < (right >>> 0) ? 1 : 0; break;
       }
-      D[--sp - 1] = r;
+      stackDepth--;
+      dataStack[stackDepth - 1] = res;
       continue;
     }
 
-    switch (op) {
-      case 0x00: return done(0);
-      case 0x01: D[sp++] = (p[next - 1] << 24) >> 24; break;
-      case 0x02: D[sp++] = p[next - 4] | (p[next - 3] << 8) | (p[next - 2] << 16) | (p[next - 1] << 24); break;
-      case 0x03: sp--; break;
-      case 0x04: D[sp] = D[sp - 1]; sp++; break;
-      case 0x05: { const t = D[sp - 1]; D[sp - 1] = D[sp - 2]; D[sp - 2] = t; break; }
-      case 0x06: D[sp] = D[sp - 2]; sp++; break;
-      case 0x07: { const a = D[sp - 3]; D[sp - 3] = D[sp - 2]; D[sp - 2] = D[sp - 1]; D[sp - 1] = a; break; }
-      case 0x17: D[sp - 1] = -D[sp - 1] | 0; break;
-      case 0x1b: D[sp - 1] = ~D[sp - 1]; break;
+    switch (opcode) {
+      case 0x00: return terminate(0);
+      case 0x01: dataStack[stackDepth++] = (program[nextPc - 1] << 24) >> 24; break;
+      case 0x02:
+        dataStack[stackDepth++] = program[nextPc - 4] | (program[nextPc - 3] << 8) | (program[nextPc - 2] << 16) | (program[nextPc - 1] << 24);
+        break;
+      case 0x03: stackDepth--; break;
+      case 0x04: dataStack[stackDepth] = dataStack[stackDepth - 1]; stackDepth++; break;
+      case 0x05: { const t = dataStack[stackDepth - 1]; dataStack[stackDepth - 1] = dataStack[stackDepth - 2]; dataStack[stackDepth - 2] = t; break; }
+      case 0x06: dataStack[stackDepth] = dataStack[stackDepth - 2]; stackDepth++; break;
+      case 0x07: { const b = dataStack[stackDepth - 3]; dataStack[stackDepth - 3] = dataStack[stackDepth - 2]; dataStack[stackDepth - 2] = dataStack[stackDepth - 1]; dataStack[stackDepth - 1] = b; break; }
+      case 0x17: dataStack[stackDepth - 1] = (-dataStack[stackDepth - 1]) | 0; break;
+      case 0x1b: dataStack[stackDepth - 1] = ~dataStack[stackDepth - 1]; break;
       case 0x30:
       case 0x31:
       case 0x32: {
-        const rel = ((p[next - 2] | (p[next - 1] << 8)) << 16) >> 16;
-        if (op === 0x30 || (op === 0x31 ? D[--sp] === 0 : D[--sp] !== 0)) pc = next + rel;
+        const offset = ((program[nextPc - 2] | (program[nextPc - 1] << 8)) << 16) >> 16;
+        if (opcode === 0x30 || (opcode === 0x31 ? dataStack[--stackDepth] === 0 : dataStack[--stackDepth] !== 0)) pcReg = nextPc + offset;
         break;
       }
       case 0x33:
-        if (csp === 64) return done(7);
-        C[csp++] = next;
-        pc = p[next - 2] | (p[next - 1] << 8);
+        if (callDepth === 64) return terminate(7);
+        callStack[callDepth++] = nextPc;
+        pcReg = program[nextPc - 2] | (program[nextPc - 1] << 8);
         break;
       case 0x34:
-        if (csp === 0) return done(8);
-        pc = C[--csp];
+        if (callDepth === 0) return terminate(8);
+        pcReg = callStack[--callDepth];
         break;
       case 0x40: {
-        const addr = D[sp - 1];
-        if (addr < 0 || addr >= 256) return done(6);
-        D[sp - 1] = M[addr];
+        const addr = dataStack[stackDepth - 1];
+        if (addr < 0 || addr >= 256) return terminate(6);
+        dataStack[stackDepth - 1] = memory[addr];
         break;
       }
       case 0x41: {
-        const addr = D[sp - 1], v = D[sp - 2];
-        if (addr < 0 || addr >= 256) return done(6);
-        sp -= 2;
-        M[addr] = v;
+        const addr = dataStack[stackDepth - 1], val = dataStack[stackDepth - 2];
+        if (addr < 0 || addr >= 256) return terminate(6);
+        stackDepth -= 2;
+        memory[addr] = val;
         break;
       }
       case 0x50: {
-        const b = enc.encode(String(D[sp - 1]));
-        if (olen + b.length > 65536) return done(11);
-        sp--;
-        out.set(b, olen);
-        olen += b.length;
+        const enc = textEncoder.encode(String(dataStack[stackDepth - 1]));
+        if (outPtr + enc.length > 65536) return terminate(11);
+        stackDepth--;
+        outBuf.set(enc, outPtr);
+        outPtr += enc.length;
         break;
       }
       case 0x51:
-        if (olen + 1 > 65536) return done(11);
-        out[olen++] = D[--sp] & 255;
+        if (outPtr + 1 > 65536) return terminate(11);
+        outBuf[outPtr++] = dataStack[--stackDepth] & 255;
         break;
-      case 0x52: D[sp++] = inPos < inp.length ? inp[inPos++] : -1; break;
-      case 0x53: return done(D[--sp] & 255);
+      case 0x52: dataStack[stackDepth++] = inPtr < input.length ? input[inPtr++] : -1; break;
+      case 0x53: return terminate(dataStack[--stackDepth] & 255);
     }
   }
 }
 
-const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-for (const id of readdirSync(I).sort()) {
-  const p = new Uint8Array(readFileSync(join(I, id, 'program.bin')));
-  const inp = new Uint8Array(readFileSync(join(I, id, 'input.bin')));
-  const r = runVM(p, inp);
-  mkdirSync(join(O, id), { recursive: true });
-  writeFileSync(join(O, id, 'stdout.bin'), r.stdout);
-  writeFileSync(join(O, id, 'exit.txt'), `${r.exit}\n`);
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+
+for (const id of readdirSync(inputDir).sort()) {
+  const prog = new Uint8Array(readFileSync(pathJoin(inputDir, id, 'program.bin')));
+  const inp = new Uint8Array(readFileSync(pathJoin(inputDir, id, 'input.bin')));
+  const res = executeVM(prog, inp);
+
+  mkdirSync(pathJoin(outputDir, id), { recursive: true });
+  writeFileSync(pathJoin(outputDir, id, 'stdout.bin'), res.stdout);
+  writeFileSync(pathJoin(outputDir, id, 'exit.txt'), `${res.exit}\n`);
 }
